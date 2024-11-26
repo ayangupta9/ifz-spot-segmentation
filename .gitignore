@@ -3,3 +3,5 @@ venv/
 .env/
 saved_models/
 logs/
+results/
+data/

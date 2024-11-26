@@ -9,6 +9,9 @@ from scipy import ndimage
 import glob
 import matplotlib.pyplot as plt
 import rasterio
+from scipy.ndimage import gaussian_filter
+from skimage.transform import rotate
+import torch
 from tqdm.notebook import trange
 
 
@@ -84,11 +87,15 @@ def min_max_norm(img):
     return (img - np.min(img, axis=(0,1)))/(np.max(img, axis=(0,1)) - np.min(img, axis=(0,1)))
 
 
-def check_nir(b4,b5,mask):
-    i,j = np.where(mask == 1)
-    b4_mean = b4[i,j].mean()
-    b5_mean = b5[i,j].mean()
-
+def check_nir(b4,b5,mask=None):
+    if mask != None:    
+        i,j = np.where(mask == 1)
+        b4_mean = b4[i,j].mean()
+        b5_mean = b5[i,j].mean()
+    else:
+        b4_mean = b4.mean()
+        b5_mean = b5.mean()
+        
     return (b4, b5) if b4_mean > b5_mean else (b5, b4)
 
 
@@ -97,14 +104,17 @@ def read_band(ds,idx):
     return min_max_norm(ds.read(idx))
 
 
-def read_data(path,mask_p):
+def read_data(path,mask_p=None):
     with rasterio.open(path) as dataset:
         B,G,R, thermal = read_band(dataset, 1), read_band(dataset, 2), read_band(dataset, 3), read_band(dataset, 6)
         
         band4, band5 = read_band(dataset, 4), read_band(dataset, 5)
         # tag4, tag5 = dataset.tags(4), dataset.tags(5)
 
-        mask = read_mask(mask_p)
+        if mask_p !=None:
+            mask = read_mask(mask_p)
+        else:
+            mask = None
         # mask = np.rot90(mask, k=-1)
         nir, rededge = check_nir(band4, band5, mask)
 
@@ -200,6 +210,21 @@ def extract_patches_with_center_rotation(img, patch_size=100, stride=50, min_ang
     return image_patches, mask_patches
 
 
+def rotate_crop(img):
+    corrected_image = rotate(img, angle=-13.25, resize=True)
+
+    # Find the rows and columns where the values are non-zero
+    non_zero_rows = np.where(np.any(corrected_image != 0, axis=1))[0]
+    non_zero_cols = np.where(np.any(corrected_image != 0, axis=0))[0]
+
+    # Get the first and last non-zero rows and columns
+    row_start, row_end = non_zero_rows[0], non_zero_rows[-1]
+    col_start, col_end = non_zero_cols[0], non_zero_cols[-1]
+
+    # Crop the image using the identified bounds
+    cropped_image = corrected_image[row_start:row_end + 1, col_start:col_end + 1]
+    return cropped_image
+
 
 def get_final_data_paths():
     patterns_suffixes = [
@@ -231,6 +256,46 @@ def get_final_data_paths():
     return final_train_images, final_masks    
 
 
+    
+def perform_stitching(data, test_preds):
+    full_height, full_width, num_classes = data.shape[0], data.shape[1], 4
+    full_image = torch.zeros((full_height, full_width, num_classes), dtype=torch.float32)
+    weight_sum = torch.zeros((full_height, full_width, 1), dtype=torch.float32)
+
+    base_weight_mask_np = np.zeros((128, 128))
+    base_weight_mask_np[64, 64] = 1
+    base_weight_mask_np = gaussian_filter(base_weight_mask_np, sigma=32)
+    base_weight_mask = torch.tensor(base_weight_mask_np, dtype=torch.float32)
+
+    patch_size, stride = 128, 64
+    patch_index = 0
+
+    for y in range(0, full_height, stride):
+        for x in range(0, full_width, stride):
+            patch = test_preds[patch_index]
+
+            weight_mask = base_weight_mask.clone()  # Ensure a fresh copy for each patch
+            if y + patch_size > full_height:
+                weight_mask[(full_height - y):, :] = 0
+            if x + patch_size > full_width:
+                weight_mask[:, (full_width - x):] = 0
+
+            weighted_patch = patch * weight_mask[..., None]
+
+            y_end = min(y + patch_size, full_height)
+            x_end = min(x + patch_size, full_width)
+
+            # Accumulate predictions and weights
+            full_image[y:y_end, x:x_end] = full_image[y:y_end, x:x_end] + weighted_patch[:y_end - y, :x_end - x]
+            weight_sum[y:y_end, x:x_end] = weight_sum[y:y_end, x:x_end] + weight_mask[:y_end - y, :x_end - x, None]
+
+            patch_index += 1
+    
+    full_image /= torch.maximum(weight_sum, torch.tensor(1.0))
+    final_prediction = torch.argmax(full_image, dim=-1)
+    return final_prediction.numpy()
+
+
 
 if __name__ == "__main__":
     final_train_images, final_masks = get_final_data_paths()
@@ -252,3 +317,5 @@ if __name__ == "__main__":
 
     np.save('./mask_patches_np.npy', mask_patches_np)
     np.save('./image_patches_np.npy', image_patches_np)
+    
+    

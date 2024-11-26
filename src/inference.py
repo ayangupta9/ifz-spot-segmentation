@@ -5,9 +5,11 @@ from sklearn.metrics import confusion_matrix
 import seaborn as sns
 import matplotlib.pyplot as plt
 import numpy as np
+from preprocessing import read_band, rotate_crop, read_data, perform_stitching
 import sys
 from PIL import Image
 import os
+import rasterio
 
 def cf_matrix_cal(y_true, y_pred, save_path):
     conf_matrix = confusion_matrix(y_true=y_true.view(-1).numpy(), y_pred=y_pred.view(-1).numpy())
@@ -53,7 +55,7 @@ def validation_inference(validation_dataloader, model, run_name):
     metrics = calc_metrics(num_classes=4, y_true=val_msks, y_pred=val_preds)
     cf_matrix_cal(y_true=val_msks, y_pred=val_preds, save_path=f"./results/{run_name}_val_cfmatrix.png")
     return metrics
-    
+
 def training_inference(training_dataloader, model, run_name):
     model = model.cuda()
     model.eval()
@@ -77,8 +79,42 @@ def training_inference(training_dataloader, model, run_name):
     metrics = calc_metrics(num_classes=4, y_true=train_msks, y_pred=train_preds)
     cf_matrix_cal(y_true=train_msks, y_pred=train_preds, save_path=f"./results/{run_name}_train_cfmatrix.png")
     return metrics
+
+
+def test_inference(test_path, model, run_name):
+    model.eval()
+    model = model.cuda()
+
+    test_preds = []
+    test_imgs = np.load('./data/test_patches_np.npy')
+
+    for img in tqdm(test_imgs):
+        img = torch.tensor(img).permute(-1,0,1).unsqueeze(0).cuda()
+        pred = torch.softmax(model(img.cuda()).detach().cpu(), dim=1)
+        test_preds.append(pred)
+
+    test_preds = torch.concat(test_preds).permute(0,2,3,1)
+    data = rotate_crop(read_data(test_path))
     
+    final_prediction = perform_stitching(data, test_preds=test_preds)
     
+    # Save color coded image
+    color_map = {
+        0: (0, 0, 0),         # Background - Black
+        1: (0, 255, 0),       # Class 1 - Green
+        2: (255, 255, 0),     # Class 2 - Yellow
+        3: (255, 0, 0),       # Class 3 - Red
+    }
+
+    height, width = final_prediction.shape
+    color_image = np.zeros((height, width, 3), dtype=np.uint8)
+
+    for class_index, color in color_map.items():
+        color_image[final_prediction == class_index] = color
+
+    Image.fromarray(color_image).save(f"./results/test_prediction_color_mask_{run_name}.png", dpi=(600, 600))
+    
+
 def calc_metrics(num_classes, y_true: torch.Tensor, y_pred: torch.Tensor):
     iou_fn = torchmetrics.JaccardIndex(task='multiclass', average='none', num_classes=num_classes).cpu()
     f1_fn = torchmetrics.F1Score(task='multiclass', average='none', num_classes=num_classes).cpu()
